@@ -194,6 +194,7 @@ class MainActivity : ComponentActivity() {
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                Log.d("TRACE", "action_down")
                 downTime = event.downTime
                 maxPressure = event.pressure
                 minPressure = event.pressure
@@ -219,6 +220,7 @@ class MainActivity : ComponentActivity() {
             }
 
             MotionEvent.ACTION_MOVE -> {
+                Log.d("TRACE", "action_move")
                 maxPressure = maxOf(maxPressure, event.pressure)
                 minPressure = minOf(minPressure, event.pressure)
                 val tm = event.toolMajor
@@ -233,6 +235,7 @@ class MainActivity : ComponentActivity() {
             }
 
             MotionEvent.ACTION_UP -> {
+                Log.d("TRACE", "action_up")
                 processHistoricalPoints(event)
                 logSyncPoint("ACTION_UP", event)
                 captureLiveDumpsysSnapshot("ACTION_UP")
@@ -419,6 +422,20 @@ class MainActivity : ComponentActivity() {
         val calculatedHzStr = if (calculatedHz > 0.0) "%.1f Hz".format(calculatedHz) else "N/A"
         val hasHardwareBatching = maxHistoryBatchSize > 0 || totalHistorySamples > 0 || calculatedHz > 30.0
 
+        // Signal B: Hardware Dispatch Latency (SystemClock.uptimeMillis() - event.eventTime)
+        val nowUptimeMs = SystemClock.uptimeMillis()
+        val dispatchLatencyMs = nowUptimeMs - event.eventTime
+        val nowNano = System.nanoTime()
+        val eventNano = event.eventTime * 1_000_000L
+        val nanoLatencyMs = if (eventNano > 0L) (nowNano - eventNano) / 1_000_000.0 else 0.0
+        val isPhysicalHardwareLatency = dispatchLatencyMs >= 3L
+        val latencyAnalysisStr = when {
+            dispatchLatencyMs < 0L -> "Invalid Negative Clock Drift (${dispatchLatencyMs} ms)"
+            dispatchLatencyMs < 3L -> "SUSPICIOUS / ZERO LATENCY (${dispatchLatencyMs} ms - Instant User-Space/Accessibility Injection)"
+            dispatchLatencyMs in 3L..50L -> "NORMAL PHYSICAL HARDWARE LATENCY (${dispatchLatencyMs} ms - Real Digitizer Travel Time)"
+            else -> "HIGH DISPATCH LATENCY (${dispatchLatencyMs} ms - Delayed Thread Dispatch)"
+        }
+
         val reportText = """
             === TOUCH EVENT TELEMETRY ===
             Action: ${MotionEvent.actionToString(event.actionMasked)} (Index: ${event.actionIndex})
@@ -430,6 +447,12 @@ class MainActivity : ComponentActivity() {
             • Verified Action Masked: $verifiedActionStr
             • Verified Raw Location (X, Y): $verifiedRawPosStr
             • Verified Event Time Nanos: $verifiedTimeNanosStr
+            
+            [ Hardware Dispatch Latency (Signal B) ]
+            • Dispatch Latency (uptimeMillis - eventTime): $dispatchLatencyMs ms
+            • Precision Nano Latency: ${"%.2f".format(nanoLatencyMs)} ms
+            • Latency Status: $latencyAnalysisStr
+            • Physical Hardware Travel Verified: ${if (isPhysicalHardwareLatency) "YES (Kernel -> IPC -> Window Latency)" else "NO (Instant Software Injection)"}
             
             [ Touch Dimensions ]
             • Touch Major: $touchMajor
