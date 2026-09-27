@@ -51,6 +51,11 @@ class MainActivity : ComponentActivity() {
     private var minHistoryDeltaMs = Double.MAX_VALUE
     private var maxHistoryDeltaMs = 0.0
 
+    // Layer 2 Anomaly Detection Tracking
+    private val recentPressures = mutableListOf<Float>()
+    private val recentTouchSizes = mutableListOf<Float>()
+    private var hasSeenMoveEvent = false
+
     private lateinit var inputManager: InputManager
 
     // Off the UI thread so shelling out never blocks touch dispatch.
@@ -349,12 +354,6 @@ class MainActivity : ComponentActivity() {
                     "obscured=$isObscured rawFlagsHex=0x${event.flags.toUInt().toString(16)}"
         )
 
-        val isHumanTouch =
-            isTouch && event.deviceId > 0 && device?.isVirtual == false &&
-                    toolType == MotionEvent.TOOL_TYPE_FINGER &&
-                    event.pointerCount == 1 &&
-                    !isObscured
-
         val isMouseClick =
             isMouse &&
                     event.deviceId > 0 &&
@@ -436,6 +435,35 @@ class MainActivity : ComponentActivity() {
             else -> "HIGH DISPATCH LATENCY (${dispatchLatencyMs} ms - Delayed Thread Dispatch)"
         }
 
+        // --- Layered Synthetic Touch Detection Architecture ---
+        // Layer 1: Standard Hardware Check
+        val isLayer1HumanTouch = isTouch && event.deviceId > 0 && device?.isVirtual == false &&
+                toolType == MotionEvent.TOOL_TYPE_FINGER &&
+                event.pointerCount == 1 &&
+                !isObscured
+
+        // Layer 2: Deep Anomaly Analysis (Fallback for OPPO / Accessibility Services / Remote Injection)
+        val hasConstantPressureAnomaly = recentPressures.size >= 5 && recentPressures.all { it == recentPressures.first() }
+        val hasConstantTouchSizeAnomaly = recentTouchSizes.size >= 5 && recentTouchSizes.all { it == recentTouchSizes.first() }
+        val hasMoveAnomaly = (event.actionMasked == MotionEvent.ACTION_UP) && !hasSeenMoveEvent
+        val hasPollingIntervalAnomaly = (historyDeltaCount > 1) && (minHistoryDeltaMs == maxHistoryDeltaMs || minHistoryDeltaMs <= 0.0)
+        val hasZeroLatencyAnomaly = dispatchLatencyMs < 2L
+
+        val isLayer2SyntheticBot = hasConstantPressureAnomaly ||
+                hasConstantTouchSizeAnomaly ||
+                hasMoveAnomaly ||
+                hasPollingIntervalAnomaly ||
+                hasZeroLatencyAnomaly
+
+        val isLayer2Passed = (isTouch && toolType == MotionEvent.TOOL_TYPE_FINGER && event.pointerCount == 1 && !isObscured) && !isLayer2SyntheticBot
+
+        // Final Decision: Pass Layer 1 OR Pass Layer 2 Fallback
+        val isHumanTouchFinal = if (isLayer1HumanTouch) {
+            true
+        } else {
+            isLayer2Passed
+        }
+
         val reportText = """
             === TOUCH EVENT TELEMETRY ===
             Action: ${MotionEvent.actionToString(event.actionMasked)} (Index: ${event.actionIndex})
@@ -453,6 +481,16 @@ class MainActivity : ComponentActivity() {
             • Precision Nano Latency: ${"%.2f".format(nanoLatencyMs)} ms
             • Latency Status: $latencyAnalysisStr
             • Physical Hardware Travel Verified: ${if (isPhysicalHardwareLatency) "YES (Kernel -> IPC -> Window Latency)" else "NO (Instant Software Injection)"}
+            
+            [ Layered Synthetic Touch Detection ]
+            • Layer 1 Standard Check: ${if (isLayer1HumanTouch) "PASS (Hardware Device ID & Non-Virtual)" else "FAIL (Virtual Device / OS Rerouted / Obscured)"}
+            • Layer 2 Anomaly Analysis (OPPO / Accessibility Fallback): ${if (isLayer2Passed) "PASS (Genuine Human Gesture Dynamics)" else "FAIL (Synthetic / Bot / Remote Control Anomaly)"}
+            • Anomaly - Instant Down/Up without Move: $hasMoveAnomaly
+            • Anomaly - Constant Pressure (Past 5 touches): $hasConstantPressureAnomaly
+            • Anomaly - Constant Touch Size (Past 5 touches): $hasConstantTouchSizeAnomaly
+            • Anomaly - Fixed Remote Polling Interval (AnyDesk/TeamViewer): $hasPollingIntervalAnomaly
+            • Anomaly - Zero Dispatch Latency (< 2ms): $hasZeroLatencyAnomaly
+            • Final Decision: ${if (isHumanTouchFinal) "ACCEPT (Human Touch)" else if (isMouseClick) "ACCEPT (Mouse Click)" else "REJECT (Virtual/Synthetic Bot Detected)"}
             
             [ Touch Dimensions ]
             • Touch Major: $touchMajor
@@ -498,8 +536,7 @@ class MainActivity : ComponentActivity() {
             • Window Partially Obscured: $isPartiallyObscured
             • Edge Flags: $edgeFlagsHex
             • OS Rerouted / Unverified: $isRerouted
-            • Is Human Touch: $isHumanTouch
-            • Decision: ${if (isHumanTouch) "ACCEPT (Human Touch)" else if (isMouseClick) "ACCEPT (Mouse Click)" else "REJECT (Virtual/Automated)"}
+            • Is Human Touch: $isHumanTouchFinal
             
             [ Hardware Digitizer Batching & Polling Rate (Suggestion 4) ]
             • Current Batch History Size: $historySize
@@ -533,7 +570,7 @@ class MainActivity : ComponentActivity() {
             toolTypeName = toolTypeStr,
             pointerCount = event.pointerCount,
             windowObscured = isObscured,
-            isHumanTouch = isHumanTouch,
+            isHumanTouch = isHumanTouchFinal,
             isVirtual = device?.isVirtual ?: true
         )
 
@@ -543,25 +580,42 @@ class MainActivity : ComponentActivity() {
             when {
                 isMouseClick -> {
                     runOnUiThread {
-//                        showDialog("A mouse click has been detected.")
-                        Toast.makeText(this, "Clicked", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "Clicked (Mouse)", Toast.LENGTH_SHORT).show()
                     }
                 }
 
-                !isHumanTouch -> {
+                !isHumanTouchFinal -> {
+                    val failureReasons = mutableListOf<String>()
+                    if (!isTouch) failureReasons.add("Source is not touchscreen ($inputSourceName)")
+                    if (event.deviceId <= 0) failureReasons.add("Device ID <= 0 (${event.deviceId})")
+                    if (device?.isVirtual == true) failureReasons.add("Device isVirtual = true")
+                    if (toolType != MotionEvent.TOOL_TYPE_FINGER) failureReasons.add("ToolType is not FINGER ($toolTypeStr)")
+                    if (event.pointerCount != 1) failureReasons.add("PointerCount != 1 (${event.pointerCount})")
+                    if (isObscured) failureReasons.add("Window fully obscured (FLAG_WINDOW_IS_OBSCURED)")
+                    if (isPartiallyObscured) failureReasons.add("Window partially obscured (FLAG_WINDOW_IS_PARTIALLY_OBSCURED)")
+                    if (hasMoveAnomaly) failureReasons.add("Instant Down/Up gesture without Move events")
+                    if (hasConstantPressureAnomaly) failureReasons.add("Constant pressure across past 5 touches ($recentPressures)")
+                    if (hasConstantTouchSizeAnomaly) failureReasons.add("Constant touch size across past 5 touches ($recentTouchSizes)")
+                    if (hasPollingIntervalAnomaly) failureReasons.add("Fixed/Zero polling interval (Min: $minIntervalStr, Max: $maxIntervalStr)")
+                    if (hasZeroLatencyAnomaly) failureReasons.add("Zero dispatch latency ($dispatchLatencyMs ms)")
+                    if (isRerouted) failureReasons.add("OS Rerouted / Unverified HMAC")
+
+                    val reasonLog = failureReasons.joinToString("; ")
+                    Log.e("SYNTHETIC_DETECTION", "REJECTED VIRTUAL CLICK! Triggering values: $reasonLog")
+
                     runOnUiThread {
-//                        showDialog(
-//                            "A virtual click or synthetic touch source was detected. " +
-//                                    "Automated inputs, scripts, and auto-clickers are disabled for security reasons."
-//                        )
-                        Toast.makeText(this, "Clicked", Toast.LENGTH_SHORT).show()
+                        showDialog(
+                            "A virtual click, synthetic touch source, or automated bot pattern was detected.\n\n" +
+                                    "Detection Triggers:\n• " + failureReasons.joinToString("\n• ")
+                        )
+                        Toast.makeText(this, "Synthetic Touch Detected", Toast.LENGTH_SHORT).show()
                     }
                 }
-                else -> Toast.makeText(this, "Clicked", Toast.LENGTH_SHORT).show()
+                else -> Toast.makeText(this, "Human Touch Accepted", Toast.LENGTH_SHORT).show()
             }
         }
 
-        return isHumanTouch || isMouseClick
+        return isHumanTouchFinal || isMouseClick
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
